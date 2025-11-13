@@ -1,6 +1,7 @@
 // src/controllers/playlistController.js
 import mongoose from "mongoose";
 import Playlist from "../models/Playlist.js";
+import Music from "../models/Music.js";
 
 //Helpers
 function toClient(p, me) {
@@ -46,7 +47,7 @@ export async function createPlaylist(req, res) {
       tracks: [],
     });
 
-    return res.status(201).json({
+    return res.status(200).json({
       message: "Playlist created",
       playlist: toClient(playlist, admin),
     });
@@ -64,12 +65,36 @@ export async function getPlaylist(req, res) {
     if (!mongoose.isValidObjectId(id)) return notFound(res);
 
     const playlist = await Playlist.findById(id)
-      .populate([{ path: "admin", select: "_id fName lName profilePic" }, { path: "members", select: "_id" }]);
+      .populate([
+        { path: "admin", select: "_id fName lName profilePic" },   // unchanged
+        { path: "members", select: "_id" },                        // unchanged
+        {
+          // only the fields you asked for from Music
+          path: "tracks.musicId",
+          select: "_id title artist album fileUrl artworkUrl duration",
+        },
+      ]);
 
     if (!playlist) return notFound(res);
 
+    const base = toClient(playlist, req.user?.id); // keeps isMember, counts, etc. :contentReference[oaicite:3]{index=3}
+
+    // Map each track to the minimal shape
+    const tracks = (playlist.tracks || []).map(t => ({
+      trackId: t.musicId?._id ?? null,
+      title: t.musicId?.title ?? null,
+      artist: t.musicId?.artist ?? null,
+      album: t.musicId?.album ?? null,
+      fileUrl: t.musicId?.fileUrl ?? null,
+      artworkUrl: t.musicId?.artworkUrl ?? null,
+      duration: typeof t.musicId?.duration === "number" ? t.musicId.duration : null,
+    }));
+
     return res.status(200).json({
-      playlist: toClient(playlist, req.user?.id),
+      playlist: {
+        ...base,          // title, description, image, admin, members, etc.
+        tracks,           // minimal fields only
+      },
     });
   } catch (err) {
     return res.status(500).json({ message: "Failed to get playlist", error: String(err) });
@@ -248,33 +273,36 @@ export async function addTrack(req, res) {
   try {
     const me = req.user?.id;
     const id = req.params.id;
+    const { trackId } = req.body || {};
+
     if (!mongoose.isValidObjectId(id)) return notFound(res);
+    if (!mongoose.isValidObjectId(trackId)) return badRequest(res, "Valid trackId is required");
 
     const playlist = await Playlist.findById(id);
     if (!playlist) return notFound(res);
-    if (!isOwner(playlist, me)) return res.status(403).json({ message: "Forbidden" });
+    if (String(playlist.admin) !== String(me)) return res.status(403).json({ message: "Forbidden" });
 
-    const { title, artwork, trackUrl } = req.body || {};
-    if (!title || !trackUrl) {
-      return badRequest(res, "title and trackUrl are required");
-    }
+    // ensure the Music doc exists
+    const music = await Music.findById(trackId).select("_id").lean();
+    if (!music) return notFound(res, "Track not found in Music");
 
-    const track = {
-      title: String(title).trim(),
-      artwork: typeof artwork === "string" ? artwork.trim() : undefined,
-      trackUrl: String(trackUrl).trim(),
+    // prevent duplicates (optional but recommended)
+    const exists = (playlist.tracks || []).some(t => String(t.musicId) === String(trackId));
+    if (exists) return badRequest(res, "Track already in playlist");
+
+    playlist.tracks.push({
+      musicId: trackId,
       addedBy: me,
       addedAt: new Date(),
-    };
+    });
 
-    playlist.tracks.push(track);
     await playlist.save();
 
     const created = playlist.tracks[playlist.tracks.length - 1];
 
-    return res.status(201).json({
+    return res.status(200).json({
       message: "Track added",
-      track: created,
+      track: created, // {_id, musicId, addedBy, addedAt}
       playlistId: playlist._id,
     });
   } catch (err) {
@@ -318,16 +346,30 @@ export async function removeTrack(req, res) {
   try {
     const me = req.user?.id;
     const { id, trackId } = req.params;
-    if (!mongoose.isValidObjectId(id) || !mongoose.isValidObjectId(trackId)) return notFound(res);
+    if (!mongoose.isValidObjectId(id) || !mongoose.isValidObjectId(trackId)) {
+      return notFound(res);
+    }
 
     const playlist = await Playlist.findById(id);
     if (!playlist) return notFound(res);
-    if (!isOwner(playlist, me)) return res.status(403).json({ message: "Forbidden" });
+    if (String(playlist.admin) !== String(me)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
-    const track = playlist.tracks.id(trackId);
-    if (!track) return notFound(res, "Track not found");
+    // 1) Try by subdocument _id (the old way / UI drag handles, etc.)
+    let track = playlist.tracks.id(trackId);
 
-    track.deleteOne();
+    // 2) If not found, try by musicId (Music._id)
+    if (!track) {
+      const idx = (playlist.tracks || []).findIndex(t => String(t.musicId) === String(trackId));
+      if (idx === -1) return notFound(res, "Track not found");
+      // Remove by index using the subdoc _id we do have
+      const subdocId = playlist.tracks[idx]._id;
+      playlist.tracks.id(subdocId).deleteOne();
+    } else {
+      track.deleteOne();
+    }
+
     await playlist.save();
 
     return res.status(200).json({ message: "Track removed", playlistId: playlist._id });
@@ -335,6 +377,7 @@ export async function removeTrack(req, res) {
     return res.status(500).json({ message: "Failed to remove track", error: String(err) });
   }
 }
+
 
 
 export async function reorderTracks(req, res) {

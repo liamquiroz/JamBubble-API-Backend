@@ -18,6 +18,11 @@ import {
   // Checkers
   checkEmailExists,
   checkMobileExists,
+
+  //Apple and ios auth
+    authGoogle,
+  authApple,
+
 } from '../controllers/authController.js';
 
 const router = express.Router();
@@ -42,5 +47,9 @@ router.post('/reset-password', resetPassword);
 //Uniqueness Checks
 router.post('/check-email', checkEmailExists);
 router.post('/check-mobile', checkMobileExists);
+
+// New SSO routes
+router.post("/google", authGoogle); // body: { idToken, deviceId? }
+router.post("/apple", authApple);   // body: { identityToken, rawNonce, deviceId? }
 
 export default router;

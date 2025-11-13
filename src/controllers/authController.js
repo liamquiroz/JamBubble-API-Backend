@@ -13,6 +13,18 @@ import { sendOtpMail, sendWelcomeMail } from '../utils/sendMail.js';
 import { randomBytes } from 'crypto';
 import ResetTicket from '../models/ResetTicket.js';
 
+//Google Apple Auth
+import { OAuth2Client } from "google-auth-library";
+import { jwtVerify, createRemoteJWKSet  } from "jose";
+
+//google Apple Auth
+const googleClient = new OAuth2Client(process.env.GOOGLE_WEB_CLIENT_ID);
+const APPLE_ISS = "https://appleid.apple.com";
+const AppleJWKS = createRemoteJWKSet (new URL("https://appleid.apple.com/auth/keys"));
+const signAccessToken = (user) =>
+  jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "15m" });
+
+
 //for forgot password ticket
 const TICKET_TTL_MIN = Number(process.env.RESET_TICKET_TTL_MINUTES);
 const ABS_WINDOW_MIN = Number(process.env.RESET_ABSOLUTE_WINDOW_MINUTES);
@@ -130,14 +142,13 @@ export const loginUser = async (req, res) => {
   const { mobileNo, password, deviceId } = req.body;
 
   try {
-    if (!mobileNo || !password) {
+    if (!mobileNo || !password)
       return res.status(400).json({ message: 'mobileNo and password are required' });
-    }
 
-    const user = await User.findOne({ mobileNo });
-    if (!user || !user.isVerified) {
+    // must include +password
+    const user = await User.findOne({ mobileNo }).select('+password');
+    if (!user || !user.isVerified)
       return res.status(401).json({ message: 'User not found or not verified' });
-    }
 
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
@@ -145,7 +156,6 @@ export const loginUser = async (req, res) => {
     const existing = user.devices?.find((d) => d.deviceId === deviceId);
     if (existing) existing.loginTime = new Date();
     else if (deviceId) user.devices.push({ deviceId, loginTime: new Date() });
-
     await user.save();
 
     const token = signToken(user);
@@ -155,6 +165,7 @@ export const loginUser = async (req, res) => {
     return res.status(500).json({ message: 'Something went wrong' });
   }
 };
+
 
 //LOGIN with sms otp
 export const loginOtpStart = async (req, res) => {
@@ -536,5 +547,124 @@ export const checkMobileExists = async (req, res) => {
     return res.status(400).json({ message: 'Invalid type' });
   } catch {
     return res.status(500).json({ message: 'Server error' });
+  }
+};
+
+
+//google Apple Auth
+export const authGoogle = async (req, res) => {
+  try {
+    const { idToken, deviceId } = req.body;
+    if (!idToken) return res.status(400).json({ message: "Missing idToken" });
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_WEB_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    if (!payload) return res.status(401).json({ message: "Invalid Google token" });
+
+    const provider = "google";
+    const providerUserId = payload.sub;
+    const verifiedEmail = payload.email_verified ? payload.email : undefined;
+
+    // 1) Find by provider identity
+    let user = await User.findByProvider(provider, providerUserId);
+
+    // 2) If not found and we have a verified email, link to existing account by email
+    if (!user && verifiedEmail) {
+      user = await User.findOne({ email: verifiedEmail });
+      if (user) {
+        await user.linkProvider({ provider, providerUserId, emailAtSignIn: verifiedEmail });
+      }
+    }
+
+    // 3) If still not found, create new user
+    if (!user) {
+      user = await User.create({
+        email: verifiedEmail || undefined,
+        fName: payload.given_name || "",
+        lName: payload.family_name || "",
+        isVerified: true,
+        providerIdentities: [{ provider, providerUserId, emailAtSignIn: verifiedEmail }],
+        devices: deviceId ? [{ deviceId }] : [],
+      });
+    }
+
+    user.lastLoginAt = new Date();
+    await user.save();
+
+    const token = signAccessToken(user);
+
+    return res.json({
+      message: "Login Successful",
+      token,
+      user: { id: user._id, profileId: user.profileId },
+    });
+  } catch (err) {
+    return res.status(500).json({ message: "Something went wrong" });
+  }
+};
+
+export const authApple = async (req, res) => {
+  try {
+    const { identityToken, rawNonce, deviceId } = req.body;
+    if (!identityToken || !rawNonce) {
+      return res.status(400).json({ message: "Missing identityToken or nonce" });
+    }
+
+    // Verify Apple identity token (audience must be your iOS bundle id)
+    const { payload } = await jwtVerify(identityToken, AppleJWKS, {
+      issuer: APPLE_ISS,
+      audience: process.env.APPLE_BUNDLE_ID,
+    });
+
+    // Verify the nonce: token contains SHA-256(nonce)
+    const crypto = await import("crypto");
+    const expected = crypto.createHash("sha256").update(rawNonce).digest("hex");
+    if (payload.nonce !== expected) {
+      return res.status(401).json({ message: "Nonce mismatch" });
+    }
+
+    const provider = "apple";
+    const providerUserId = String(payload.sub);
+    const verifiedEmail =
+      payload.email_verified === "true" || payload.email_verified === true
+        ? payload.email
+        : undefined;
+
+    // 1) Find by provider identity
+    let user = await User.findByProvider(provider, providerUserId);
+
+    // 2) If not found and verified email exists, link to existing account
+    if (!user && verifiedEmail) {
+      user = await User.findOne({ email: verifiedEmail });
+      if (user) {
+        await user.linkProvider({ provider, providerUserId, emailAtSignIn: verifiedEmail });
+      }
+    }
+
+    // 3) If still not found, create new user (Apple may hide email; that's fine)
+    if (!user) {
+      user = await User.create({
+        email: verifiedEmail || undefined,
+        isVerified: true,
+        providerIdentities: [{ provider, providerUserId, emailAtSignIn: verifiedEmail }],
+        devices: deviceId ? [{ deviceId }] : [],
+      });
+    }
+
+    user.lastLoginAt = new Date();
+    await user.save();
+
+    const token = signAccessToken(user);
+
+    return res.json({
+      message: "Login Successful",
+      token,
+      user: { id: user._id, profileId: user.profileId },
+    });
+  } catch (err) {
+    return res.status(500).json({ message: "Something went wrong" });
   }
 };

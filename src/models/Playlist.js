@@ -5,21 +5,11 @@ const { Schema, model, models, Types } = mongoose;
 
 const TrackSchema = new Schema(
   {
-    title: {
-      type: String,
+    musicId: {
+      type: Types.ObjectId,
+      ref: "Music",
       required: true,
-      trim: true,
-      minlength: 1,
-      maxlength: 200,
-    },
-    artwork: {
-      type: String,
-      trim: true,
-    },
-    trackUrl: {
-      type: String,
-      required: true,
-      trim: true,
+      index: true,
     },
     addedAt: {
       type: Date,
@@ -29,12 +19,13 @@ const TrackSchema = new Schema(
       type: Types.ObjectId,
       ref: "User",
       required: true,
+      index: true,
     },
   },
   { _id: true }
 );
 
-//Playlist
+// Playlist
 const PlaylistSchema = new Schema(
   {
     playlistTitle: {
@@ -70,6 +61,7 @@ const PlaylistSchema = new Schema(
         index: true,
       },
     ],
+    // now stores only references to Music
     tracks: {
       type: [TrackSchema],
       default: [],
@@ -96,7 +88,7 @@ PlaylistSchema.virtual("trackCount").get(function () {
   return Array.isArray(this.tracks) ? this.tracks.length : 0;
 });
 
-//Indexes
+// Indexes
 PlaylistSchema.index({ admin: 1, playlistTitle: 1 }, { unique: true });
 PlaylistSchema.index({ createdAt: -1 });
 PlaylistSchema.index({ likesCount: -1 });

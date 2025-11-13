@@ -32,6 +32,14 @@ const musicSchema = new mongoose.Schema({
         type: String,
         required: false,
     },
+    artworkUrl: {
+        type: String,
+        required: false,
+    },
+    artworkPublicId: {
+        type: String,
+        required: false,
+    },
     uploadedAt: {
         type: Date,
         default: Date.now,
